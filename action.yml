@@ -58,6 +58,63 @@ inputs:
     default: "max"
 
 
+  # ── GitHub OIDC, registry push ──────────────────────────────────────────────
+  #
+  # Federated identity: no key and no secret is held anywhere. GitHub issues the
+  # token at run time and STS or Entra exchanges it, so the SAME identity works
+  # from any runner -- an EKS pod pushing to ACR, an AKS pod pushing to ECR, or
+  # a GitHub-hosted runner with no cloud identity of its own.
+  #
+  # SETTING ONE IS THE SWITCH, PER CLOUD. Give a role ARN and ECR auth is done
+  # by OIDC; give a client ID and ACR auth is. Leave one empty and that cloud
+  # goes through its existing chain untouched, so a caller that sets neither
+  # behaves exactly as it does today.
+  #
+  # An exchange that then FAILS is fatal rather than falling through to the key
+  # and secret branches. Naming an identity says which one to use; quietly
+  # authenticating as a different one would defeat the point of configuring it,
+  # and a secretless pipeline that silently starts using a static key again is
+  # the failure nobody notices.
+  #
+  # Named for the registry, not the cloud, because that is their whole scope: a
+  # role that may push images, not general access to the account. An identity
+  # here should carry AcrPush or ECR push on ONE registry and nothing else.
+  #
+  # Deliberately NOT the azure_client_id / aws_access_key_id inputs below. Those
+  # name an identity belonging to the runner's own cloud -- a UAMI federated to
+  # a service account, or one attached to a node -- and the identity federated
+  # to GitHub is a different object.
+  #
+  # Requires the CALLING workflow to grant the token; a composite action cannot.
+  # Missing, the run fails naming the permission rather than reporting whatever
+  # the token endpoint said:
+  #
+  #   permissions:
+  #     id-token: write
+  #     contents: read
+
+  aws_ecr_oidc_role_arn:
+    description: "IAM role assumed via AssumeRoleWithWebIdentity to push to ECR, e.g. arn:aws:iam::1234:role/GitHubActionsECRPush. Set it and ECR auth uses OIDC. Account and region come from aws_registry."
+    required: false
+    default: ""
+  aws_ecr_oidc_audience:
+    description: "Audience requested for the GitHub token on the ECR exchange. Must appear in the IAM OIDC provider's client ID list."
+    required: false
+    default: "sts.amazonaws.com"
+
+  azure_acr_oidc_client_id:
+    description: "Client ID of the Entra app registration (or UAMI) holding a federated credential for this repository, with AcrPush on azure_registry. Set it and ACR auth uses OIDC. Separate from azure_client_id, which names a workload or node identity."
+    required: false
+    default: ""
+  azure_acr_oidc_tenant_id:
+    description: "Tenant of that app registration. Falls back to azure_tenant_id when empty."
+    required: false
+    default: ""
+  azure_acr_oidc_audience:
+    description: "Audience requested for the GitHub token on the ACR exchange. Matches what a federated credential expects by default."
+    required: false
+    default: "api://AzureADTokenExchange"
+
   # Azure credentials (used if not on AKS WI/MSI)
   azure_client_id:
     description: "Azure App/Identity client ID"
@@ -199,6 +256,12 @@ runs:
         AAD_CLIENT_ID:     ${{ inputs.azure_client_id }}
         AAD_CLIENT_SECRET: ${{ inputs.azure_client_secret }}
         AAD_TENANT_ID:     ${{ inputs.azure_tenant_id }}
+        # GitHub OIDC. A DIFFERENT identity from AZURE_CLIENT_ID above: that one
+        # is a UAMI belonging to the runner's cluster or node, this one is an
+        # app registration with a federated credential for this repository.
+        AZURE_ACR_OIDC_CLIENT_ID: ${{ inputs.azure_acr_oidc_client_id }}
+        AZURE_ACR_OIDC_TENANT_ID: ${{ inputs.azure_acr_oidc_tenant_id }}
+        AZURE_ACR_OIDC_AUDIENCE:  ${{ inputs.azure_acr_oidc_audience }}
       with:
         script: |
           const fs = require('fs');
@@ -221,6 +284,70 @@ runs:
 
           let aadToken = null;
           let tenant = process.env.AZURE_TENANT_ID || '';
+
+          // --- 0) GitHub OIDC (federated credential on an app registration) ---
+          //
+          // The same exchange as Workload Identity below, with the assertion
+          // fetched from GitHub instead of read off disk -- which is why it
+          // works from a runner in ANY cloud, including an EKS pod pushing to
+          // ACR, where no Azure identity exists at all.
+          //
+          // Setting the client id is the switch, and a failure here is FATAL:
+          // it must not fall through to a UAMI or a stored secret, which would
+          // authenticate as a different identity than the caller asked for.
+          const ghClientId = (process.env.AZURE_ACR_OIDC_CLIENT_ID || '').trim();
+          if (ghClientId) {
+            const ghTenant = (process.env.AZURE_ACR_OIDC_TENANT_ID
+                              || process.env.AAD_TENANT_ID || '').trim();
+            const ghAudience = (process.env.AZURE_ACR_OIDC_AUDIENCE
+                                || 'api://AzureADTokenExchange').trim();
+
+            core.info('Using GitHub OIDC');
+            core.info(`  client id: ${ghClientId}`);
+            core.info(`  tenant:    ${ghTenant || '(none)'}`);
+            core.info(`  audience:  ${ghAudience}`);
+
+            if (!ghTenant) {
+              throw new Error(
+                'azure_acr_oidc_client_id is set but no tenant is available. ' +
+                'Set azure_acr_oidc_tenant_id, or azure_tenant_id for it to fall back to.');
+            }
+            if (!process.env.ACTIONS_ID_TOKEN_REQUEST_URL) {
+              core.error('azure_acr_oidc_client_id is set, but this job cannot request an OIDC token.');
+              core.info('Add this to the CALLING workflow, at job or workflow level:');
+              core.info('');
+              core.info('  permissions:');
+              core.info('    id-token: write');
+              core.info('    contents: read');
+              core.info('');
+              core.info('A composite action cannot grant it for you.');
+              throw new Error('Missing id-token: write permission in the calling workflow.');
+            }
+
+            const assertion = await core.getIDToken(ghAudience);
+            try {
+              const res = await postForm(`https://login.microsoftonline.com/${ghTenant}/oauth2/v2.0/token`, {
+                client_id: ghClientId,
+                grant_type: 'client_credentials',
+                scope: 'https://management.azure.com/.default',
+                client_assertion_type: 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer',
+                client_assertion: assertion,
+              });
+              aadToken = res.access_token;
+            } catch (e) {
+              // Entra's body names the cause: AADSTS70021 is no federated
+              // credential matching this subject, AADSTS700213 an audience
+              // mismatch. Both are configuration, not transient.
+              throw new Error(
+                `GitHub OIDC exchange failed for client ${ghClientId} in tenant ${ghTenant}. ` +
+                `Check the app registration has a federated credential whose subject matches ` +
+                `this repository and ref, with audience "${ghAudience}". ${e.message}`);
+            }
+            if (!aadToken) {
+              throw new Error('GitHub OIDC exchange returned no access_token.');
+            }
+            tenant = ghTenant;
+          }
 
           // --- 1) AKS Workload Identity (token file + client_id + tenant) ---
           const wiFile = process.env.AZURE_FEDERATED_TOKEN_FILE;
@@ -333,6 +460,10 @@ runs:
         NO_PROXY: 169.254.170.23,169.254.169.254
         STATIC_AWS_ACCESS_KEY_ID:     ${{ inputs.aws_access_key_id }}
         STATIC_AWS_SECRET_ACCESS_KEY: ${{ inputs.aws_secret_access_key }}
+        AWS_ECR_OIDC_ROLE_ARN: ${{ inputs.aws_ecr_oidc_role_arn }}
+        AWS_ECR_OIDC_AUDIENCE: ${{ inputs.aws_ecr_oidc_audience }}
+        AWS_ECR_OIDC_REGION:   ${{ steps.awsreg.outputs.region }}
+        AWS_ECR_OIDC_SESSION:  ${{ github.repository }}-${{ github.run_id }}
       with:
         script: |
           const fs   = require('fs/promises');
@@ -358,6 +489,112 @@ runs:
             core.exportVariable('AWS_SECRET_ACCESS_KEY', creds.secretAccessKey);
             if (creds.sessionToken) core.exportVariable('AWS_SESSION_TOKEN', creds.sessionToken);
             core.info(`Selected AWS credential source: ${source}`);
+          }
+
+          // ---------- GitHub OIDC ----------
+          //
+          // The one STS call that needs no AWS credentials: GitHub signs a
+          // token for this run, AWS verifies it against GitHub's published keys
+          // and against the role's trust policy, and returns a temporary key.
+          // Nothing is stored anywhere, so it works from a runner in any cloud
+          // or none.
+          //
+          // Every failure here is FATAL. Naming a role says which identity to
+          // use; quietly falling through to Pod Identity or a static key would
+          // authenticate as something else, and a pipeline that silently went
+          // back to a stored key is the regression nobody notices.
+          async function getOidcCreds(roleArn, audience, region, sessionName) {
+            core.startGroup('GitHub OIDC diagnostics');
+            try {
+              core.info(`role:     ${roleArn}`);
+              core.info(`audience: ${audience}`);
+              core.info(`region:   ${region || '(none derived from aws_registry)'}`);
+
+              if (!process.env.ACTIONS_ID_TOKEN_REQUEST_URL) {
+                // Printed line by line rather than one message with escapes:
+                // this is the error people actually hit, and it has to be
+                // copy-pasteable out of the log.
+                core.error('aws_ecr_oidc_role_arn is set, but this job cannot request an OIDC token.');
+                core.info('Add this to the CALLING workflow, at job or workflow level:');
+                core.info('');
+                core.info('  permissions:');
+                core.info('    id-token: write');
+                core.info('    contents: read');
+                core.info('');
+                core.info('A composite action cannot grant it for you.');
+                core.setFailed('Missing id-token: write permission in the calling workflow.');
+                return null;
+              }
+
+              let token;
+              try {
+                token = await core.getIDToken(audience);
+              } catch (e) {
+                core.setFailed(`Could not obtain a GitHub OIDC token: ${e.message}`);
+                return null;
+              }
+
+              // Regional endpoint, from the registry host. A role in one account
+              // is global to STS, but the regional endpoint keeps the call in
+              // the same region as the registry it is about to push to.
+              const host = region ? `sts.${region}.amazonaws.com` : 'sts.amazonaws.com';
+
+              // Session name is what CloudTrail shows. Sanitised to what STS
+              // accepts -- a slash from owner/repo is rejected outright.
+              const session = (sessionName || 'multicloud-build')
+                .replace(/[^\w+=,.@-]/g, '-').slice(0, 64);
+
+              const body = new URLSearchParams({
+                Action: 'AssumeRoleWithWebIdentity',
+                Version: '2011-06-15',
+                RoleArn: roleArn,
+                RoleSessionName: session,
+                WebIdentityToken: token,
+                DurationSeconds: '3600',
+              });
+
+              const r = await tryFetch(`https://${host}/`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                body: body.toString(),
+              }, 10000);
+
+              if (r._err) {
+                core.setFailed(`STS unreachable at ${host}: ${r._err}`);
+                return null;
+              }
+
+              const text = await r.text();
+              if (!r.ok) {
+                // The body names the actual cause -- almost always a trust
+                // policy whose sub condition does not match this repository or
+                // ref -- so it is printed rather than summarised.
+                core.info(text.slice(0, 2000));
+                core.setFailed(
+                  `AssumeRoleWithWebIdentity failed with HTTP ${r.status}. ` +
+                  'Check the role trust policy names this org and ref, and that ' +
+                  `its audience list contains "${audience}".`);
+                return null;
+              }
+
+              const pick = (tag) => (text.match(new RegExp(`<${tag}>([^<]+)</${tag}>`)) || [])[1];
+              const creds = {
+                accessKeyId: pick('AccessKeyId'),
+                secretAccessKey: pick('SecretAccessKey'),
+                sessionToken: pick('SessionToken'),
+              };
+              if (!creds.accessKeyId || !creds.secretAccessKey || !creds.sessionToken) {
+                core.info(text.slice(0, 2000));
+                core.setFailed('STS returned no credentials in its response.');
+                return null;
+              }
+
+              core.info(`assumed ${roleArn} as ${session}`);
+              core.info(`access key: ${redact(creds.accessKeyId)}`);
+              return creds;
+            } finally {
+              core.endGroup();
+            }
           }
 
           // ---------- Pod Identity ----------
@@ -454,6 +691,20 @@ runs:
 
           // ---------- main ----------
           core.info(`Provider reported by detect-cloud: ${provider || 'unknown'}`);
+
+          // Naming a role is the switch. Set, and OIDC is the only source tried
+          // -- including on a runner that HAS Pod Identity, because the caller
+          // asked for this identity rather than that one.
+          const oidcRole = (process.env.AWS_ECR_OIDC_ROLE_ARN || '').trim();
+          if (oidcRole) {
+            const creds = await getOidcCreds(
+              oidcRole,
+              (process.env.AWS_ECR_OIDC_AUDIENCE || 'sts.amazonaws.com').trim(),
+              (process.env.AWS_ECR_OIDC_REGION || '').trim(),
+              (process.env.AWS_ECR_OIDC_SESSION || '').trim());
+            if (creds) setEnv(creds, 'GitHubOIDC');
+            return;   // core.setFailed has already fired if creds is null
+          }
 
           if (provider === 'aws') {
             let creds = await getPodIdentityCredsDiag();

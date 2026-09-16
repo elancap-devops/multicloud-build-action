@@ -45,8 +45,22 @@ It’s a **turnkey GitOps automation platform** for AWS and Azure — combining 
 
 ## 🔑 Required permissions
 
-No additional permissions are required.  
-This action works with the default `contents: read` permission that GitHub provides to all jobs.
+No additional permissions are required for the credential sources that come from
+the runner itself (Pod Identity, Workload Identity, MSI, static keys). This
+action works with the default `contents: read` that GitHub gives every job.
+
+**GitHub OIDC is the exception.** If you set `aws_ecr_oidc_role_arn` or
+`azure_acr_oidc_client_id`, the calling workflow must grant the token — a
+composite action cannot grant it for itself:
+
+```yaml
+permissions:
+  id-token: write
+  contents: read
+```
+
+Without it the action fails and says so, rather than quietly falling back to a
+stored key.
 
 ---
 
@@ -81,6 +95,11 @@ This action works with the default `contents: read` permission that GitHub provi
 | `extra_args`            | ❌       | `""`         | Additional args to pass to BuildKit/Bake (advanced).                                                          |
 | `aws_registry`          | ❌       | `""`         | AWS ECR registry URL (e.g., `123456789012.dkr.ecr.eu-west-1.amazonaws.com`). **Required if** `push` includes `aws`. |
 | `azure_registry`        | ❌       | `""`         | Azure ACR registry URL (e.g., `myacr.azurecr.io`). **Required if** `push` includes `azure`.                   |
+| `aws_ecr_oidc_role_arn` | ❌       | `""`         | IAM role assumed via GitHub OIDC to push to ECR. **Setting it makes OIDC the ECR auth method.** Account and region come from `aws_registry`. |
+| `aws_ecr_oidc_audience` | ❌       | `sts.amazonaws.com` | Audience requested for the GitHub token. Must appear in the IAM OIDC provider's client ID list.        |
+| `azure_acr_oidc_client_id` | ❌    | `""`         | Client ID of the Entra app registration with a federated credential for this repo. **Setting it makes OIDC the ACR auth method.** Not the same identity as `azure_client_id`. |
+| `azure_acr_oidc_tenant_id` | ❌    | `""`         | Tenant of that app registration. Falls back to `azure_tenant_id`.                                        |
+| `azure_acr_oidc_audience`  | ❌    | `api://AzureADTokenExchange` | Audience requested for the GitHub token on the Azure exchange.                          |
 | `azure_client_id`       | ❌       | `""`         | Azure client ID (fallback when not using WI/MSI).                                                             |
 | `azure_client_secret`   | ❌       | `""`         | Azure client secret (fallback).                                                                               |
 | `azure_tenant_id`       | ❌       | `""`         | Azure tenant ID (fallback).                                                                                   |
@@ -115,14 +134,26 @@ Example payload (after hashing):
 
 ## 🔐 Auth (automatic selection)
 
-- **Azure (ACR):** AKS **Workload Identity** → node **MSI** (UAMI/SAI via IMDS) → **client secret** fallback.  
-- **AWS (ECR):** **Pod Identity** (EKS) → **node role** (IMDS) → **static access keys** fallback.
+- **Azure (ACR):** **GitHub OIDC** → AKS **Workload Identity** → node **MSI** (UAMI/SAI via IMDS) → **client secret** fallback.  
+- **AWS (ECR):** **GitHub OIDC** → **Pod Identity** (EKS) → **node role** (IMDS) → **static access keys** fallback.
+
+GitHub OIDC is only attempted when you name an identity for that cloud, and then
+it is the **only** method tried: naming a role or client id says which identity
+to use, so falling back to a different one would defeat the point of configuring
+it. Set neither and the chains behave exactly as they always have.
+
+Because the token comes from GitHub rather than from the cloud the runner sits
+in, the same identity works **from anywhere** — an EKS pod pushing to ACR, an AKS
+pod pushing to ECR, or a GitHub-hosted runner with no cloud identity at all. It
+is also the only option here that stores no key and no secret.
 
 > ⚠️ **Token Expiry Notice**  
 > Credentials obtained from Pod Identity, Node MSI/IMDS, or other metadata sources typically **expire after about one hour**.  
 > If your builds may run longer, break them into smaller Bake targets or sequential jobs to avoid mid-build authentication failures.
 
-> On **GitHub-hosted** runners, use Azure client secret or AWS keys when pushing to that cloud.
+> On **GitHub-hosted** runners, use GitHub OIDC — it needs no stored credential.
+> Azure client secret and AWS access keys remain supported for installations that
+> have not set up federated identity yet.
 
 ---
 
