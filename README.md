@@ -62,6 +62,52 @@ permissions:
 Without it the action fails and says so, rather than quietly falling back to a
 stored key.
 
+### Where to put it
+
+On the job that runs the action, so the rest of the workflow keeps the
+repository default. Declaring `permissions:` makes it **exhaustive** — every
+scope you do not list becomes `none` — so a workflow-level block can silently
+revoke what another job was relying on:
+
+```yaml
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: gitopsmanager/multicloud-build-action@v1
+        with:
+          push: both
+          image: team/svc-a
+          aws_registry:             ${{ vars.AWS_ECR_REGISTRY }}
+          aws_ecr_oidc_role_arn:    ${{ vars.AWS_ECR_OIDC_ROLE_ARN }}
+          azure_registry:           ${{ vars.AZURE_ACR_REGISTRY }}
+          azure_acr_oidc_client_id: ${{ vars.AZURE_ACR_OIDC_CLIENT_ID }}
+          azure_acr_oidc_tenant_id: ${{ vars.AZURE_ACR_OIDC_TENANT_ID }}
+```
+
+**If this action runs inside a reusable workflow, the grant must come from the
+workflow that CALLS it.** Permissions only ever narrow down a chain: a called
+workflow cannot give itself a scope the caller withheld, so adding the block to
+the inner job alone leaves `id-token` at `none`.
+
+```yaml
+# the TOP-level workflow
+jobs:
+  build:
+    uses: my-org/shared-actions/.github/workflows/docker-build.yaml@v1
+    permissions:
+      id-token: write
+      contents: read
+```
+
+None of these values are secret — a role ARN and a client id are useless without
+the trust relationship — so they belong in organisation **variables**, not
+secrets.
+
 ---
 
 ## 📦 External Actions Used
