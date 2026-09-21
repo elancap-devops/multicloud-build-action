@@ -13,7 +13,7 @@ branding:
 inputs:
   image_details:
     description: |
-      JSON array of {context, build_file, image_name} or specify a single build with separate parmeters. 
+      JSON array of {context, build_file, image_name} or specify a single build with separate parmeters.
       Example:
       [
         {"context":"./services/a","build_file":"Dockerfile","image_name":"team/svc-a"},
@@ -26,7 +26,7 @@ inputs:
     required: false
     default: "."
   image:
-    description: "Image name (e.g. gitopsmanager)"
+    description: "Image name (e.g. elancap-devops)"
     required: false
   tag:
     description: "Tag for the image"
@@ -149,7 +149,7 @@ runs:
     # Detect which cloud this runner is on (self-hosted ⇒ aws/azure, GH-hosted ⇒ unknown)
     - name: Detect cloud
       id: cloud
-      uses: gitopsmanager/detect-cloud@v1
+      uses: elancap-devops/detect-cloud@v1
       with:
         timeout-ms: 800
 
@@ -886,7 +886,7 @@ runs:
       run: |
         docker buildx create --name remote-builder --driver remote tcp://127.0.0.1:12345
         docker buildx use remote-builder
-        docker buildx inspect --bootstrap   
+        docker buildx inspect --bootstrap
 
 
 
